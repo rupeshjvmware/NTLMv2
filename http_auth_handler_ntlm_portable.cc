@@ -22,6 +22,7 @@
 #include "net/base/zap.h"
 #include "net/http/des.h"
 #include "net/http/md4.h"
+#include <openssl/hmac.h>
 
 namespace net {
 
@@ -87,6 +88,7 @@ namespace net {
 // is based on documentation from: http://davenport.sourceforge.net/ntlm.html
 //-----------------------------------------------------------------------------
 
+static bool sNTLMv1Forced = false; // Use this varaiable to force NTLMv1
 enum {
   NTLM_NegotiateUnicode             = 0x00000001,
   NTLM_NegotiateOEM                 = 0x00000002,
@@ -181,12 +183,21 @@ static bool SendLM() {
 // Byte order swapping.
 #define SWAP16(x) ((((x) & 0xff) << 8) | (((x) >> 8) & 0xff))
 #define SWAP32(x) ((SWAP16((x) & 0xffff) << 16) | (SWAP16((x) >> 16)))
+#define SWAP64(x) ((SWAP32((x) & 0xffffffff) << 32) | (SWAP32((x) >> 32)))
 
 static void* WriteBytes(void* buf, const void* data, uint32_t data_len) {
   memcpy(buf, data, data_len);
   return static_cast<char*>(buf) + data_len;
 }
 
+static void* WriteQWORD(void* buf, const void* data, uint64_t qword) {
+#ifdef IS_BIG_ENDIAN
+        // NTLM uses little endian on the wire.
+        qword = SWAP64(qword);
+#endif
+        return WriteBytes(buf, data, sizeof(qword));
+}
+    
 static void* WriteDWORD(void* buf, uint32_t dword) {
 #ifdef IS_BIG_ENDIAN
   // NTLM uses little endian on the wire.
@@ -376,9 +387,11 @@ static int GenerateType1Msg(void** out_buf, uint32_t* out_len) {
 
 struct Type2Msg {
   uint32_t flags;            // NTLM_Xxx bitwise combination
-  uint8_t challenge[8];      // 8 byte challenge
+  uint8_t challenge[NTLM_CHAL_LEN]; // 8 byte challenge
   const void* target;        // target string (type depends on flags)
   uint32_t target_len;       // target length in bytes
+  const uint8_t *targetInfo; // target Attribute-Value pairs (DNS domain, et al)
+  uint32_t    targetInfoLen; // target AV pairs length in bytes
 };
 
 // Returns OK or a network error code.
@@ -435,9 +448,20 @@ static int ParseType2Msg(const void* in_buf, uint32_t in_len, Type2Msg* msg) {
   LogFlags(msg->flags);
   LogBuf("challenge", msg->challenge, sizeof(msg->challenge));
 
-  // We currently do not implement LMv2/NTLMv2 or NTLM2 responses,
-  // so we can ignore target information.  We may want to enable
-  // support for these alternate mechanisms in the future.
+  // Read (and skip) the reserved field
+  ReadUint32(cursor);
+  ReadUint32(cursor);
+  // Read target name security buffer: ...
+  // ... read target length.
+  uint32_t targetInfoLen = ReadUint16(cursor);
+  // ... skip next 16-bit "allocated space" value.
+  ReadUint16(cursor);
+  // ... read offset from inBuf.
+  offset = ReadUint32(cursor);
+  uint32_t targetInfoEnd = offset;
+  targetInfoEnd += targetInfoLen;
+  msg->targetInfoLen = targetInfoLen;
+  msg->targetInfo = ((const uint8_t*)in_buf) + offset;
   return OK;
 }
 
@@ -466,6 +490,10 @@ static int GenerateType3Msg(const base::string16& domain,
     return rv;
 
   bool unicode = (msg.flags & NTLM_NegotiateUnicode) != 0;
+    
+  // There is no negotiation for NTLMv2, so we just do it unless we are forced
+  // by explict user configuration to use the older DES-based cryptography.
+  bool ntlmv2 = (sNTLMv1Forced == false);
 
   // Temporary buffers for unicode strings
 #ifdef IS_BIG_ENDIAN
@@ -481,6 +509,8 @@ static int GenerateType3Msg(const base::string16& domain,
   const void* host_ptr;
   uint32_t domain_len, user_len, host_len;
 
+  // This is for NTLM, for NTLMv2 we set the new full length once we know it
+  uint16_t ntlmRespLen = NTLM_RESP_LEN;
   //
   // Get domain name.
   //
@@ -539,22 +569,93 @@ static int GenerateType3Msg(const base::string16& domain,
     host_len = hostname.length();
   }
 
-  //
-  // Now that we have generated all of the strings, we can allocate out_buf.
-  //
-  *out_len = NTLM_TYPE3_HEADER_LEN + host_len + domain_len + user_len +
-             LM_RESP_LEN + NTLM_RESP_LEN;
-  *out_buf = malloc(*out_len);
-  if (!*out_buf)
-    return ERR_OUT_OF_MEMORY;
-
+  
   //
   // Next, we compute the LM and NTLM responses.
   //
   uint8_t lm_resp[LM_RESP_LEN];
   uint8_t ntlm_resp[NTLM_RESP_LEN];
   uint8_t ntlm_hash[NTLM_HASH_LEN];
-  if (msg.flags & NTLM_NegotiateNTLM2Key) {
+  uint8_t ntlmv2_hash[NTLM_HASH_LEN];
+  uint8_t ntlmv2_response_hash[NTLMv2_HASH_LEN];
+  uint8_t ntlmv2_blob1[NTLMv2_BLOB1_LEN];
+
+  if (ntlmv2) {
+      // NTLMv2 mode, the default
+      base::string16 userUpper, domainUpper;
+      std::string ntlmHashStr;
+      std::string ntlmv2HashStr;
+      std::string lmv2ResponseStr;
+      std::string ntlmv2ResponseStr;
+      
+      // temporary buffers for unicode strings
+      base::string16 ucsDomainUpperBuf;
+      base::string16 ucsUserUpperBuf;
+      const void *domainUpperPtr;
+      const void *userUpperPtr;
+      uint32_t domainUpperLen;
+      uint32_t userUpperLen;
+      uint32_t ntlmv2KeyLen;
+      
+      if (msg.targetInfoLen == 0) {
+          
+          return ERR_UNEXPECTED;
+      }
+      
+      base::string16 strUserUpper = username;
+      std::transform(strUserUpper.begin(), strUserUpper.end(),strUserUpper.begin(), ::toupper);
+      ucsUserUpperBuf = strUserUpper;
+      
+      userUpperPtr = ucsUserUpperBuf.data();
+      userUpperLen = ucsUserUpperBuf.length() * 2;
+#ifdef IS_BIG_ENDIAN
+      WriteUnicodeLE(const_cast<void*>(userUpperPtr), (const base::char16*) userUpperPtr,
+                     ucsUserUpperBuf.length());
+#endif
+      
+      base::string16 strDomainUpper = domain;
+      std::transform(strDomainUpper.begin(), strDomainUpper.end(),strDomainUpper.begin(), ::toupper);
+      ucsDomainUpperBuf = strDomainUpper;
+      domainUpperPtr = ucsDomainUpperBuf.data();
+      domainUpperLen = ucsDomainUpperBuf.length() * 2;
+#ifdef IS_BIG_ENDIAN
+      WriteUnicodeLE(const_cast<void*>(domainUpperPtr),
+                     static_cast<const char16_t*>(domainUpperPtr),
+                     ucsDomainUpperBuf.length());
+#endif
+      NTLM_Hash(password, ntlm_hash);
+      HMAC_CTX ctx;
+      HMAC_CTX_init(&ctx);
+      HMAC_Init_ex(&ctx, ntlm_hash, NTLM_HASH_LEN, EVP_md5(), NULL);
+      HMAC_Update(&ctx, (const uint8_t*)userUpperPtr, userUpperLen);
+      HMAC_Update(&ctx, (const uint8_t*)domainUpperPtr, domainUpperLen);
+      HMAC_Final(&ctx, ntlmv2_hash, &ntlmv2KeyLen);
+      HMAC_CTX_cleanup(&ctx);
+      
+      // Prepare Blob
+      memset(ntlmv2_blob1, 0, NTLMv2_BLOB1_LEN);
+      time_t unix_time;
+      uint64_t nt_time = time(&unix_time);
+      nt_time += 11644473600LL;    // Number of seconds betwen 1601 and 1970
+      nt_time *= 1000 * 1000 * 10; // Convert seconds to 100 ns units
+      
+      ntlmv2_blob1[0] = 1;
+      ntlmv2_blob1[1] = 1;
+      
+      WriteQWORD(&ntlmv2_blob1[8], &nt_time,sizeof(uint64_t));
+      GenerateRandom(&ntlmv2_blob1[16], NTLM_CHAL_LEN);
+      HMAC_CTX_init(&ctx);
+      HMAC_Init_ex(&ctx, ntlmv2_hash, NTLM_HASH_LEN, EVP_md5(), NULL);
+      HMAC_Update(&ctx, (const uint8_t*)msg.challenge, NTLM_CHAL_LEN);
+      HMAC_Update(&ctx, (const uint8_t*)ntlmv2_blob1, NTLMv2_BLOB1_LEN);
+      HMAC_Update(&ctx, (const uint8_t*)msg.targetInfo, msg.targetInfoLen);
+      HMAC_Final(&ctx, ntlmv2_response_hash, &ntlmv2KeyLen);
+      HMAC_CTX_cleanup(&ctx);
+      ntlmRespLen = NTLMv2_RESP_LEN + NTLMv2_BLOB1_LEN;
+      ntlmRespLen += msg.targetInfoLen;
+      
+  }
+  else if (msg.flags & NTLM_NegotiateNTLM2Key) {
     // compute NTLM2 session response
     base::MD5Digest session_hash;
     uint8_t temp[16];
@@ -584,6 +685,17 @@ static int GenerateType3Msg(const base::string16& domain,
     }
   }
 
+    //
+    // Now that we have generated all of the strings, we can allocate out_buf.
+    //
+    //
+    //
+   *out_len = NTLM_TYPE3_HEADER_LEN + host_len + domain_len + user_len +
+              LM_RESP_LEN + ntlmRespLen;
+   *out_buf = malloc(*out_len);
+   if (!*out_buf)
+       return ERR_OUT_OF_MEMORY;
+
   //
   // Finally, we assemble the Type-3 msg :-)
   //
@@ -603,8 +715,25 @@ static int GenerateType3Msg(const base::string16& domain,
 
   // 20 : NTLM response sec buf
   offset += LM_RESP_LEN;
-  cursor = WriteSecBuf(cursor, NTLM_RESP_LEN, offset);
-  memcpy(static_cast<uint8_t*>(*out_buf) + offset, ntlm_resp, NTLM_RESP_LEN);
+  cursor = WriteSecBuf(cursor, ntlmRespLen, offset);
+  if (ntlmv2) {
+      
+      memcpy(static_cast<uint8_t*>(*out_buf) + offset, ntlmv2_response_hash,
+             NTLMv2_RESP_LEN);
+      offset += NTLMv2_RESP_LEN;
+     
+      memcpy(static_cast<uint8_t*>(*out_buf) + offset, ntlmv2_blob1,
+             NTLMv2_BLOB1_LEN);
+      offset += NTLMv2_BLOB1_LEN;
+     
+      memcpy(static_cast<uint8_t*>(*out_buf) + offset, msg.targetInfo,
+             msg.targetInfoLen);
+      
+    }
+  else
+  {
+      memcpy(static_cast<uint8_t*>(*out_buf) + offset, ntlm_resp, NTLM_RESP_LEN);
+  }
 
   // 28 : domain name sec buf
   offset = NTLM_TYPE3_HEADER_LEN;
